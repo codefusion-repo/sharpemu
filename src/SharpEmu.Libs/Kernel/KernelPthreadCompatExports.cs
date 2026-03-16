@@ -3,6 +3,7 @@
 
 using SharpEmu.HLE;
 using System.Threading;
+using System.Diagnostics.CodeAnalysis;
 
 namespace SharpEmu.Libs.Kernel;
 
@@ -606,7 +607,7 @@ public static class KernelPthreadCompatExports
         return mutexAddress;
     }
 
-    private static bool TryResolveMutexState(CpuContext ctx, ulong mutexAddress, bool createIfZero, out ulong resolvedAddress, out PthreadMutexState? state)
+    private static bool TryResolveMutexState(CpuContext ctx, ulong mutexAddress, bool createIfZero, out ulong resolvedAddress, [NotNullWhen(true)] out PthreadMutexState? state)
     {
         resolvedAddress = 0;
         state = null;
@@ -739,7 +740,7 @@ public static class KernelPthreadCompatExports
         return condAddress;
     }
 
-    private static bool TryResolveCondState(CpuContext? ctx, ulong condAddress, bool createIfZero, out ulong resolvedAddress, out PthreadCondState? state)
+    private static bool TryResolveCondState(CpuContext? ctx, ulong condAddress, bool createIfZero, out ulong resolvedAddress, [NotNullWhen(true)] out PthreadCondState? state)
     {
         resolvedAddress = 0;
         state = null;

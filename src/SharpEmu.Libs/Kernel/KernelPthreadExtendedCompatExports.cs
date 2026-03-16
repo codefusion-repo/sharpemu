@@ -5,6 +5,7 @@ using SharpEmu.HLE;
 using System.Buffers.Binary;
 using System.Text;
 using System.Threading;
+using System.Diagnostics.CodeAnalysis;
 
 namespace SharpEmu.Libs.Kernel;
 
@@ -928,7 +929,7 @@ public static class KernelPthreadExtendedCompatExports
         return rwlockAddress;
     }
 
-    private static bool TryResolveRwlockState(CpuContext ctx, ulong rwlockAddress, bool createIfZero, out ulong resolvedAddress, out ReaderWriterLockSlim? rwlock)
+    private static bool TryResolveRwlockState(CpuContext ctx, ulong rwlockAddress, bool createIfZero, out ulong resolvedAddress, [NotNullWhen(true)] out ReaderWriterLockSlim? rwlock)
     {
         resolvedAddress = 0;
         rwlock = null;
