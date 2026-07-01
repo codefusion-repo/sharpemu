@@ -3,6 +3,7 @@
 
 using SharpEmu.HLE;
 using SharpEmu.Libs.Kernel;
+using System.Buffers;
 using System.Buffers.Binary;
 using System.Collections.Concurrent;
 
@@ -25,6 +26,9 @@ public static class AmprExports
     private static readonly ConcurrentDictionary<ulong, CommandBufferState> _commandBuffers = new();
     private static readonly bool _traceAmpr =
         string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_AMPR"), "1", StringComparison.Ordinal);
+    private static readonly bool _traceAmprReads =
+        _traceAmpr ||
+        string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_AMPR_READS"), "1", StringComparison.Ordinal);
 
     private sealed class CommandBufferState
     {
@@ -625,12 +629,18 @@ public static class AmprExports
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
         }
 
-        const int ChunkSize = 64 * 1024;
-        var buffer = new byte[(int)Math.Min((ulong)ChunkSize, size)];
+        const int ChunkSize = 1024 * 1024;
+        var buffer = ArrayPool<byte>.Shared.Rent((int)Math.Min((ulong)ChunkSize, size));
 
         try
         {
-            using var stream = new FileStream(hostPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+            using var stream = new FileStream(
+                hostPath,
+                FileMode.Open,
+                FileAccess.Read,
+                FileShare.ReadWrite | FileShare.Delete,
+                ChunkSize,
+                FileOptions.SequentialScan);
             if (fileOffset >= (ulong)stream.Length)
             {
                 return (int)OrbisGen2Result.ORBIS_GEN2_OK;
@@ -662,6 +672,10 @@ public static class AmprExports
         catch (IOException)
         {
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND;
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(buffer);
         }
 
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
@@ -831,7 +845,7 @@ public static class AmprExports
         string? hostPath,
         int result)
     {
-        if (!_traceAmpr)
+        if (!_traceAmprReads)
         {
             return;
         }
