@@ -1,6 +1,9 @@
 <!--
-Copyright (C) 2026 SharpEmu Emulator Project
-SPDX-License-Identifier: GPL-2.0-or-later
+SPDX-FileCopyrightText: 2026 CodeFusion SpA
+SPDX-FileCopyrightText: 2026 SharpEmu Emulator Project
+SPDX-License-Identifier: Apache-2.0
+
+Adapted for codefusion-repo/sharpemu on 2026-07-17.
 -->
 
 # GEMINI.md
