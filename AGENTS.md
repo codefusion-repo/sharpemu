@@ -40,18 +40,7 @@ python "$PROJECT_OS_ROOT/tools/project_os_resolve.py" \
 
 El resolver acelera la resolución; el manifest sigue siendo canónico. Ambos
 solo dan forma y nunca autorizan una acción. Consulta artefactos, templates y
-skills desde las referencias resueltas, sin copiar sus contratos aquí. Usa
-`context_plan` para distinguir archivos cargados internamente, metadata
-proyectada, templates y skills referenciados; no lo trates como prueba del
-contenido entregado al modelo.
-
-Abre después de resolver solo el template aplicable, las skills solicitadas y
-las fuentes Project OS, target o evidencia viva exigidas por scope, validación
-o source basis. Reporta las lecturas reales en el recibo canónico de fuentes,
-en el envelope del output junto al artefacto, con paths relativos al repositorio
-o identificadores vivos y razones, nunca con cuerpos completos. Una lectura
-adicional requiere una razón admitida por el contrato; no recorras
-recursivamente Project OS por defecto.
+skills desde las referencias resueltas, sin copiar sus contratos aquí.
 
 ## Evidencia viva
 
