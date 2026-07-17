@@ -1568,7 +1568,9 @@ public static partial class Gen5SpirvTranslator
 
                 if (!TryEmitInstruction(instruction, out error))
                 {
-                    error = $"pc=0x{instruction.Pc:X} {instruction.Opcode}: {error}";
+                    error = Gen5InstructionHandlingContract.FormatEmitFailure(
+                        instruction,
+                        error);
                     return false;
                 }
 
@@ -1704,12 +1706,9 @@ public static partial class Gen5SpirvTranslator
             out string error)
         {
             error = string.Empty;
-            if (instruction.Opcode is
-                "SNop" or
-                "SWaitcnt" or
-                "SInstPrefetch" or
-                "STtraceData" or
-                "VInterpMovF32")
+            if (Gen5InstructionHandlingContract.TryGetIntentionalNoOpReason(
+                    instruction,
+                    out _))
             {
                 return true;
             }
@@ -1775,7 +1774,8 @@ public static partial class Gen5SpirvTranslator
                 Gen5ShaderEncoding.Smrd or
                 Gen5ShaderEncoding.Smem)
             {
-                return true;
+                error = "unsupported decoded instruction";
+                return false;
             }
 
             return TryEmitVectorAlu(instruction, out error);
@@ -2117,6 +2117,12 @@ public static partial class Gen5SpirvTranslator
             out string error)
         {
             error = string.Empty;
+            if (instruction.Opcode == "VInterpMovF32")
+            {
+                error = "unsupported decoded instruction";
+                return false;
+            }
+
             if (_stage != Gen5SpirvStage.Pixel ||
                 !_pixelInputs.TryGetValue(interpolation.Attribute, out var input) ||
                 !TryGetVectorDestination(instruction, out var destination))
