@@ -12,10 +12,8 @@
 // global-memory binding covering every store, which the emitter exposes as
 // guestBuffers[0] (descriptor set 0, binding 0).
 //
-// Each program carries an expectation: ExpectTranslate=true programs must
-// decode and emit the requested stages; ExpectTranslate=false programs pin a decode
-// failure that must stay loud. Any unexpected outcome makes the tool exit
-// non-zero, so it can gate scripts/CI.
+// Each program carries an explicit translate/decode-fail/emit-fail expectation.
+// Any unexpected outcome makes the tool exit non-zero, so it can gate scripts/CI.
 //
 // Usage: SharpEmu.Tools.ShaderDump [output-directory]
 
@@ -26,23 +24,23 @@ using SharpEmu.ShaderCompiler.Vulkan;
 
 const ulong ProgramAddress = 0x100000;
 
-(string Name, bool ExpectTranslate, uint[] Words)[] testPrograms =
+(string Name, ProgramExpectation Expectation, uint[] Words)[] testPrograms =
 [
-    ("fmac", true, [
+    ("fmac", ProgramExpectation.Translates, [
         0x560A0501,             // v_fmac_f32 v5, v1, v2
         0x580A0501, 0x42280000, // v_fmamk_f32 v5, v1, 42.0, v2
         0x5A0A0501, 0x42280000, // v_fmaak_f32 v5, v1, v2, 42.0
         0xD52B0005, 0x00020501, // v_fmac_f32_e64 v5, v1, v2
         0xBF810000,             // s_endpgm
     ]),
-    ("muls", true, [
+    ("muls", ProgramExpectation.Translates, [
         0xD5690005, 0x00020501, // v_mul_lo_u32 v5, v1, v2
         0xD56A0005, 0x00020501, // v_mul_hi_u32 v5, v1, v2
         0xD56B0005, 0x00020501, // v_mul_lo_i32 v5, v1, v2
         0xD56C0005, 0x00020501, // v_mul_hi_i32 v5, v1, v2
         0xBF810000,             // s_endpgm
     ]),
-    ("mrt", true, [
+    ("mrt", ProgramExpectation.Translates, [
         0x7E0002FF, 0x3F800000, // v_mov_b32 v0, 1.0f
         0x7E0202FF, 0x00000000, // v_mov_b32 v1, 0.0f
         0x7E0402FF, 0x00000000, // v_mov_b32 v2, 0.0f
@@ -60,7 +58,7 @@ const ulong ProgramAddress = 0x100000;
         0xF800086F, 0x0B0A0908, // exp mrt6 v8, v9, v10, v11 done
         0xBF810000,             // s_endpgm
     ]),
-    ("mrt-float2", true, [
+    ("mrt-float2", ProgramExpectation.Translates, [
         0x7E0002FF, 0x3F800000, // v_mov_b32 v0, 1.0f
         0x7E0202FF, 0x3E800000, // v_mov_b32 v1, 0.25f
         0x7E0402FF, 0x3E800000, // v_mov_b32 v2, 0.25f
@@ -69,7 +67,7 @@ const ulong ProgramAddress = 0x100000;
         0xF800081F, 0x03020100, // exp mrt1 v0, v1, v2, v3 done
         0xBF810000,             // s_endpgm
     ]),
-    ("mrt8", true, [
+    ("mrt8", ProgramExpectation.Translates, [
         0x7E0002FF, 0x3F800000, // v_mov_b32 v0, 1.0f
         0x7E0202FF, 0x00000000, // v_mov_b32 v1, 0.0f
         0x7E0402FF, 0x00000000, // v_mov_b32 v2, 0.0f
@@ -84,13 +82,13 @@ const ulong ProgramAddress = 0x100000;
         0xF800087F, 0x03020100, // exp mrt7 v0, v1, v2, v3 done
         0xBF810000,             // s_endpgm
     ]),
-    ("mrt-partial", true, [
+    ("mrt-partial", ProgramExpectation.Translates, [
         0x7E0002FF, 0x3F4CCCCD, // v_mov_b32 v0, 0.8f
         0x7E0202FF, 0x3F333333, // v_mov_b32 v1, 0.7f
         0xF8000803, 0x03020100, // exp mrt0 v0, v1, off, off done
         0xBF810000,             // s_endpgm
     ]),
-    ("mrt-partial-merge", true, [
+    ("mrt-partial-merge", ProgramExpectation.Translates, [
         0x7E0002FF, 0x3DCCCCCD, // v_mov_b32 v0, 0.1f
         0x7E0202FF, 0x3E4CCCCD, // v_mov_b32 v1, 0.2f
         0x7E0C02FF, 0x3E99999A, // v_mov_b32 v6, 0.3f
@@ -99,7 +97,7 @@ const ulong ProgramAddress = 0x100000;
         0xF800080C, 0x07060504, // exp mrt0 off, off, v6, v7 done
         0xBF810000,             // s_endpgm
     ]),
-    ("sopp-hints", true, [
+    ("sopp-hints", ProgramExpectation.Translates, [
         0xBFA10001,             // s_clause 0x1
         0xBFA30000,             // s_waitcnt_depctr 0x0
         0xBF810000,             // s_endpgm
@@ -107,16 +105,23 @@ const ulong ProgramAddress = 0x100000;
     // s_round_mode / s_denorm_mode write the FP MODE state and must keep
     // failing decode loudly until their semantics are modeled (see #108);
     // this program pins that behavior.
-    ("sopp-mode", false, [
+    ("sopp-mode", ProgramExpectation.DecodeFails, [
         0xBFA40000,             // s_round_mode 0x0
         0xBFA50000,             // s_denorm_mode 0x0
+        0xBF810000,             // s_endpgm
+    ]),
+    // s_sendmsg has an observable hardware side effect. It is recognized by
+    // the decoder but deliberately has no lowering yet, so emission must fail
+    // with the complete instruction identity instead of silently dropping it.
+    ("unsupported-sendmsg", ProgramExpectation.EmitFails, [
+        0xBF900000,             // s_sendmsg 0x0
         0xBF810000,             // s_endpgm
     ]),
     // Executable end-to-end test: compute with real ALU instructions, then
     // buffer_store_dword results to guestBuffers[0] at offsets 0/4/8, prove
     // that a store with EXEC=0 does not land (offset 12 stays sentinel), and
     // that stores work again after EXEC is restored (offset 16).
-    ("exec", true, [
+    ("exec", ProgramExpectation.Translates, [
         0xBFA10001,             // s_clause 0x1 (hint no-op in an executed program, needs #108)
         0x7E0002FF, 0x3FC00000, // v_mov_b32 v0, 1.5f
         0x7E0202FF, 0x40100000, // v_mov_b32 v1, 2.25f
@@ -143,7 +148,7 @@ var outputDirectory = args.Length > 0
 Directory.CreateDirectory(outputDirectory);
 
 var failures = 0;
-foreach (var (name, expectTranslate, words) in testPrograms)
+foreach (var (name, expectation, words) in testPrograms)
 {
     var memory = new FakeMemory();
     memory.AddRegion(ProgramAddress, words);
@@ -155,7 +160,7 @@ foreach (var (name, expectTranslate, words) in testPrograms)
 
     if (!Gen5ShaderTranslator.TryDecodeProgram(ctx, ProgramAddress, out var program, out var decodeError))
     {
-        if (expectTranslate)
+        if (expectation != ProgramExpectation.DecodeFails)
         {
             failures++;
             Console.WriteLine($"[{name}] FAILED: decode error ({decodeError})");
@@ -168,7 +173,7 @@ foreach (var (name, expectTranslate, words) in testPrograms)
         continue;
     }
 
-    if (!expectTranslate)
+    if (expectation == ProgramExpectation.DecodeFails)
     {
         failures++;
         Console.WriteLine(
@@ -211,7 +216,32 @@ foreach (var (name, expectTranslate, words) in testPrograms)
         Array.Empty<Gen5ImageBinding>(),
         globalBindings);
 
-    if (Gen5SpirvTranslator.TryCompileVertexShader(state, evaluation, out var vertexShader, out var vertexError))
+    var vertexSucceeded = Gen5SpirvTranslator.TryCompileVertexShader(
+        state,
+        evaluation,
+        out var vertexShader,
+        out var vertexError);
+    if (expectation == ProgramExpectation.EmitFails)
+    {
+        const string expectedError =
+            "block=0x0: emit-failed opcode=SSendmsg encoding=Sopp pc=0x0 " +
+            "words=[0xBF900000] detail=unsupported decoded instruction";
+        if (vertexSucceeded || vertexError != expectedError)
+        {
+            failures++;
+            Console.WriteLine(
+                $"[{name}] FAILED: expected emit failure ({expectedError}), " +
+                $"actual={(vertexSucceeded ? "success" : vertexError)}");
+        }
+        else
+        {
+            Console.WriteLine($"[{name}] emit failed as expected ({vertexError})");
+        }
+
+        continue;
+    }
+
+    if (vertexSucceeded)
     {
         var path = Path.Combine(outputDirectory, $"{name}.spv");
         File.WriteAllBytes(path, vertexShader.Spirv);
@@ -300,6 +330,13 @@ Console.WriteLine(failures == 0
     ? "RESULT: all programs behaved as expected"
     : $"RESULT: {failures} unexpected outcome(s)");
 Environment.ExitCode = failures == 0 ? 0 : 1;
+
+internal enum ProgramExpectation
+{
+    Translates,
+    DecodeFails,
+    EmitFails,
+}
 
 internal sealed class FakeMemory : ICpuMemory
 {
