@@ -49,6 +49,25 @@ public sealed class Gen5ShaderAtomicDecodeTests
         Assert.Equal(1u, control.VectorData);
     }
 
+    [Theory]
+    [InlineData(0xE0F04000u, "BufferAtomicInc", 0)]
+    [InlineData(0xE0F44004u, "BufferAtomicDec", 4)]
+    public void BufferAtomicClamp_KeepsDataLimitAndReturn(
+        uint firstWord,
+        string opcode,
+        int offsetBytes)
+    {
+        var instruction = DecodeSingle(firstWord, 0x80000100);
+
+        Assert.Equal(opcode, instruction.Opcode);
+        var control = Assert.IsType<Gen5BufferMemoryControl>(instruction.Control);
+        Assert.Equal(1u, control.DwordCount);
+        Assert.Equal(1u, control.VectorData);
+        Assert.Equal(offsetBytes, control.OffsetBytes);
+        Assert.True(control.Glc);
+        Assert.Equal(new[] { Gen5Operand.Vector(1) }, instruction.Destinations);
+    }
+
     [Fact]
     public void ImageAtomicAdd_KeepsDataRegisterAsDestination()
     {
@@ -59,6 +78,20 @@ public sealed class Gen5ShaderAtomicDecodeTests
         var control = Assert.IsType<Gen5ImageControl>(instruction.Control);
         Assert.Equal(2u, control.VectorData);
         Assert.Equal(4u, control.ScalarResource);
+        Assert.True(control.Glc);
+        Assert.Equal(new[] { Gen5Operand.Vector(2) }, instruction.Destinations);
+    }
+
+    [Theory]
+    [InlineData(0xF06C2100u, "ImageAtomicInc")]
+    [InlineData(0xF0702100u, "ImageAtomicDec")]
+    public void ImageAtomicClamp_KeepsDataLimitAndReturn(uint firstWord, string opcode)
+    {
+        var instruction = DecodeSingle(firstWord, 0x00010200);
+
+        Assert.Equal(opcode, instruction.Opcode);
+        var control = Assert.IsType<Gen5ImageControl>(instruction.Control);
+        Assert.Equal(2u, control.VectorData);
         Assert.True(control.Glc);
         Assert.Equal(new[] { Gen5Operand.Vector(2) }, instruction.Destinations);
     }
@@ -83,6 +116,20 @@ public sealed class Gen5ShaderAtomicDecodeTests
         var instruction = DecodeSingle(0xD8800000, 0x03000100);
 
         Assert.Equal("DsAddRtnU32", instruction.Opcode);
+        Assert.Equal(
+            new[] { Gen5Operand.Vector(0), Gen5Operand.Vector(1) },
+            instruction.Sources);
+        Assert.Equal(new[] { Gen5Operand.Vector(3) }, instruction.Destinations);
+    }
+
+    [Theory]
+    [InlineData(0xD88C0000u, "DsIncRtnU32")]
+    [InlineData(0xD8900000u, "DsDecRtnU32")]
+    public void DataShareAtomicClamp_KeepsLimitAndReturn(uint firstWord, string opcode)
+    {
+        var instruction = DecodeSingle(firstWord, 0x03000100);
+
+        Assert.Equal(opcode, instruction.Opcode);
         Assert.Equal(
             new[] { Gen5Operand.Vector(0), Gen5Operand.Vector(1) },
             instruction.Sources);

@@ -263,6 +263,7 @@ public static partial class Gen5SpirvTranslator
         private uint _programCounter;
         private uint _programActive;
         private uint _iterationGuard;
+        private uint _atomicClampExpected;
         private uint _globalBuffers;
         private uint _gfx10BufferFormatTable;
         private uint _storageBlockPointer;
@@ -291,6 +292,13 @@ public static partial class Gen5SpirvTranslator
             Float,
             Sint,
             Uint,
+        }
+
+        private enum AtomicClampOperation
+        {
+            None,
+            Increment,
+            Decrement,
         }
 
         private readonly record struct SpirvImageResource(
@@ -764,6 +772,15 @@ public static partial class Gen5SpirvTranslator
                 _privateBoolPointer,
                 SpirvStorageClass.Private,
                 _module.ConstantBool(true));
+            if (UsesAtomicClamp())
+            {
+                _atomicClampExpected = _module.AddGlobalVariable(
+                    _privateUintPointer,
+                    SpirvStorageClass.Private,
+                    _module.Constant(_uintType, 0));
+                _interfaces.Add(_atomicClampExpected);
+                _module.AddName(_atomicClampExpected, "atomicClampExpected");
+            }
             if (_maxDispatcherSteps > 0)
             {
                 _iterationGuard = _module.AddGlobalVariable(
@@ -2001,8 +2018,8 @@ public static partial class Gen5SpirvTranslator
             {
                 "DsAddU32" or "DsAddRtnU32" => SpirvOp.AtomicIAdd,
                 "DsSubU32" or "DsSubRtnU32" => SpirvOp.AtomicISub,
-                "DsIncU32" or "DsIncRtnU32" => SpirvOp.AtomicIIncrement,
-                "DsDecU32" or "DsDecRtnU32" => SpirvOp.AtomicIDecrement,
+                "DsIncU32" or "DsIncRtnU32" => SpirvOp.AtomicCompareExchange,
+                "DsDecU32" or "DsDecRtnU32" => SpirvOp.AtomicCompareExchange,
                 "DsMinI32" or "DsMinRtnI32" => SpirvOp.AtomicSMin,
                 "DsMaxI32" or "DsMaxRtnI32" => SpirvOp.AtomicSMax,
                 "DsMinU32" or "DsMinRtnU32" => SpirvOp.AtomicUMin,
@@ -2020,6 +2037,13 @@ public static partial class Gen5SpirvTranslator
                 return false;
             }
 
+            var clampOperation = instruction.Opcode switch
+            {
+                "DsIncU32" or "DsIncRtnU32" => AtomicClampOperation.Increment,
+                "DsDecU32" or "DsDecRtnU32" => AtomicClampOperation.Decrement,
+                _ => AtomicClampOperation.None,
+            };
+
             var address = GetRawSource(instruction, 0);
             var pointer = LdsPointer(address, control.Offset0);
             EmitExecConditional(() =>
@@ -2033,8 +2057,12 @@ public static partial class Gen5SpirvTranslator
                     // DS_CMPST sources: DATA0 is the comparator, DATA1 the new value.
                     value: () => GetRawSource(
                         instruction,
-                        atomicOp == SpirvOp.AtomicCompareExchange ? 2 : 1),
-                    comparator: () => GetRawSource(instruction, 1));
+                        clampOperation == AtomicClampOperation.None &&
+                        atomicOp == SpirvOp.AtomicCompareExchange
+                            ? 2
+                            : 1),
+                    comparator: () => GetRawSource(instruction, 1),
+                    clampOperation);
                 if (instruction.Destinations.Count > 0)
                 {
                     StoreV(instruction.Destinations[0].Value, original);
@@ -2044,11 +2072,17 @@ public static partial class Gen5SpirvTranslator
             return true;
         }
 
-        // Maps the AMD atomic-op name suffix shared by buffer/image atomics to a SPIR-V opcode.
-        // Inc/Dec approximate the AMD wrap-clamp semantics (MEM = tmp >= DATA ? 0 : tmp + 1),
-        // which is exact for the common 0xFFFFFFFF clamp operand.
-        private static bool TryGetAtomicOp(string name, out SpirvOp op)
+        private static bool TryGetAtomicOp(
+            string name,
+            out SpirvOp op,
+            out AtomicClampOperation clampOperation)
         {
+            clampOperation = name switch
+            {
+                "Inc" => AtomicClampOperation.Increment,
+                "Dec" => AtomicClampOperation.Decrement,
+                _ => AtomicClampOperation.None,
+            };
             op = name switch
             {
                 "Swap" => SpirvOp.AtomicExchange,
@@ -2062,8 +2096,7 @@ public static partial class Gen5SpirvTranslator
                 "And" => SpirvOp.AtomicAnd,
                 "Or" => SpirvOp.AtomicOr,
                 "Xor" => SpirvOp.AtomicXor,
-                "Inc" => SpirvOp.AtomicIIncrement,
-                "Dec" => SpirvOp.AtomicIDecrement,
+                "Inc" or "Dec" => SpirvOp.AtomicCompareExchange,
                 _ => SpirvOp.Nop,
             };
             return op != SpirvOp.Nop;
@@ -2076,16 +2109,18 @@ public static partial class Gen5SpirvTranslator
             uint scope,
             uint semantics,
             Func<uint> value,
-            Func<uint> comparator)
+            Func<uint> comparator,
+            AtomicClampOperation clampOperation = AtomicClampOperation.None)
         {
-            if (op is SpirvOp.AtomicIIncrement or SpirvOp.AtomicIDecrement)
+            if (clampOperation != AtomicClampOperation.None)
             {
-                return _module.AddInstruction(
-                    op,
+                return EmitAtomicClamp(
                     type,
                     pointer,
-                    UInt(scope),
-                    UInt(semantics));
+                    scope,
+                    semantics,
+                    value(),
+                    clampOperation);
             }
 
             if (op == SpirvOp.AtomicCompareExchange)
@@ -2109,6 +2144,96 @@ public static partial class Gen5SpirvTranslator
                 UInt(scope),
                 UInt(semantics),
                 value());
+        }
+
+        private uint EmitAtomicClamp(
+            uint type,
+            uint pointer,
+            uint scope,
+            uint semantics,
+            uint limit,
+            AtomicClampOperation operation)
+        {
+            var limitBits = type == _uintType ? limit : Bitcast(_uintType, limit);
+            // Seeding expected with zero avoids a non-atomic load: the first CAS
+            // either performs the exact old == 0 transition or observes the real value.
+            Store(_atomicClampExpected, UInt(0));
+
+            var loopHeader = _module.AllocateId();
+            var loopBody = _module.AllocateId();
+            var loopContinue = _module.AllocateId();
+            var loopMerge = _module.AllocateId();
+            _module.AddStatement(SpirvOp.Branch, loopHeader);
+            _module.AddLabel(loopHeader);
+            _module.AddStatement(SpirvOp.LoopMerge, loopMerge, loopContinue, 0);
+            _module.AddStatement(SpirvOp.Branch, loopBody);
+
+            _module.AddLabel(loopBody);
+            var expectedBits = Load(_uintType, _atomicClampExpected);
+            var desiredBits = operation switch
+            {
+                AtomicClampOperation.Increment => _module.AddInstruction(
+                    SpirvOp.Select,
+                    _uintType,
+                    _module.AddInstruction(
+                        SpirvOp.UGreaterThanEqual,
+                        _boolType,
+                        expectedBits,
+                        limitBits),
+                    UInt(0),
+                    IAdd(expectedBits, UInt(1))),
+                AtomicClampOperation.Decrement => _module.AddInstruction(
+                    SpirvOp.Select,
+                    _uintType,
+                    _module.AddInstruction(
+                        SpirvOp.LogicalOr,
+                        _boolType,
+                        _module.AddInstruction(
+                            SpirvOp.IEqual,
+                            _boolType,
+                            expectedBits,
+                            UInt(0)),
+                        _module.AddInstruction(
+                            SpirvOp.UGreaterThan,
+                            _boolType,
+                            expectedBits,
+                            limitBits)),
+                    limitBits,
+                    _module.AddInstruction(
+                        SpirvOp.ISub,
+                        _uintType,
+                        expectedBits,
+                        UInt(1))),
+                _ => throw new InvalidOperationException("atomic clamp operation is missing"),
+            };
+            var desired = type == _uintType ? desiredBits : Bitcast(type, desiredBits);
+            var comparator = type == _uintType ? expectedBits : Bitcast(type, expectedBits);
+            var observed = _module.AddInstruction(
+                SpirvOp.AtomicCompareExchange,
+                type,
+                pointer,
+                UInt(scope),
+                UInt(semantics),
+                UInt((semantics & ~0x8u) | 0x2u),
+                desired,
+                comparator);
+            var observedBits = type == _uintType ? observed : Bitcast(_uintType, observed);
+            var succeeded = _module.AddInstruction(
+                SpirvOp.IEqual,
+                _boolType,
+                observedBits,
+                expectedBits);
+            _module.AddStatement(
+                SpirvOp.BranchConditional,
+                succeeded,
+                loopMerge,
+                loopContinue);
+
+            _module.AddLabel(loopContinue);
+            Store(_atomicClampExpected, observedBits);
+            _module.AddStatement(SpirvOp.Branch, loopHeader);
+            _module.AddLabel(loopMerge);
+            return observed;
         }
 
         private bool TryEmitInterpolation(
@@ -2354,7 +2479,10 @@ public static partial class Gen5SpirvTranslator
 
             if (instruction.Opcode.StartsWith("BufferAtomic", StringComparison.Ordinal))
             {
-                if (!TryGetAtomicOp(instruction.Opcode["BufferAtomic".Length..], out var atomicOp))
+                if (!TryGetAtomicOp(
+                        instruction.Opcode["BufferAtomic".Length..],
+                        out var atomicOp,
+                        out var clampOperation))
                 {
                     error = $"unsupported buffer opcode {instruction.Opcode}";
                     return false;
@@ -2372,7 +2500,8 @@ public static partial class Gen5SpirvTranslator
                             scope: 1,
                             semantics: 0x48,
                             value: () => LoadV(control.VectorData),
-                            comparator: () => LoadV(control.VectorData + 1));
+                            comparator: () => LoadV(control.VectorData + 1),
+                            clampOperation);
                         if (control.Glc)
                         {
                             StoreV(control.VectorData, original);
@@ -3323,7 +3452,10 @@ public static partial class Gen5SpirvTranslator
                 }
 
                 if (resource.ComponentKind == ImageComponentKind.Float ||
-                    !TryGetAtomicOp(instruction.Opcode["ImageAtomic".Length..], out var atomicOp))
+                    !TryGetAtomicOp(
+                        instruction.Opcode["ImageAtomic".Length..],
+                        out var atomicOp,
+                        out var clampOperation))
                 {
                     error = $"unsupported storage image opcode {instruction.Opcode}";
                     return false;
@@ -3356,7 +3488,8 @@ public static partial class Gen5SpirvTranslator
                         scope: 1,
                         semantics: 0x808,
                         value: () => LoadData(image.VectorData),
-                        comparator: () => LoadData(image.VectorData + 1));
+                        comparator: () => LoadData(image.VectorData + 1),
+                        clampOperation);
                     if (image.Glc)
                     {
                         StoreV(
@@ -5266,6 +5399,18 @@ public static partial class Gen5SpirvTranslator
         private bool UsesLds() =>
             _state.Program.Instructions.Any(instruction =>
                 instruction.Control is Gen5DataShareControl);
+
+        private bool UsesAtomicClamp() =>
+            _state.Program.Instructions.Any(instruction =>
+                instruction.Opcode is
+                    "BufferAtomicInc" or
+                    "BufferAtomicDec" or
+                    "ImageAtomicInc" or
+                    "ImageAtomicDec" or
+                    "DsIncU32" or
+                    "DsIncRtnU32" or
+                    "DsDecU32" or
+                    "DsDecRtnU32");
 
         private bool UsesSubgroupShuffle() =>
             _state.Program.Instructions.Any(instruction =>
