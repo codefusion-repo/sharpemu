@@ -1,412 +1,762 @@
 // Copyright (C) 2026 SharpEmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-// Executes the SharpEmu-emitted "exec" conformance shader on a real Vulkan
-// device and compares the buffer results against CPU-computed expected values.
-//
-// The shader (exec-cs.spv, produced by SharpEmu.Tools.ShaderDump) was
-// translated by SharpEmu from hand-assembled Gen5 instruction words and stores
-// results to guestBuffers[0]:
-//   [0] v_fmac_f32   -> fma(1.5f, 2.25f, 10.0f)
-//   [1] v_mul_hi_i32 -> high 32 bits of (int)0x7FFFFFFF * (int)0x00010003
-//   [2] v_mul_lo_i32 -> low  32 bits of the same product
-//   [3] store attempted with EXEC=0 -> must NOT land (sentinel remains)
-//   [4] store after EXEC restored   -> 1.5f (0x3FC00000)
-// Every other word of the buffer must still hold the sentinel afterwards.
-//
-// Creating the compute pipeline doubles as a driver-acceptance check for the
-// emitted SPIR-V; the dispatch then verifies the arithmetic numerically.
-//
-// Usage: SharpEmu.Tools.GpuConformance <path-to-exec-cs.spv>
-
+using System.Diagnostics;
 using Silk.NET.Core.Native;
 using Silk.NET.Vulkan;
+using VulkanBuffer = Silk.NET.Vulkan.Buffer;
 
-const uint Sentinel = 0xCAFEBABE;
+return await NvidiaVulkanProbe.RunAsync(args);
 
-// Must match the 64-byte global-memory binding ShaderDump constructs for the
-// exec program.
-const ulong BufferSize = 64;
-
-var expectedFma = BitConverter.SingleToUInt32Bits(
-    MathF.FusedMultiplyAdd(1.5f, 2.25f, 10.0f));
-var product = (long)0x7FFFFFFF * 0x00010003;
-var expectedHi = (uint)(product >> 32);
-var expectedLo = (uint)product;
-var expectedRestored = BitConverter.SingleToUInt32Bits(1.5f);
-
-unsafe
+internal static class NvidiaVulkanProbe
 {
-    var spvPath = args.Length > 0
-        ? args[0]
-        : throw new InvalidOperationException(
-            "usage: SharpEmu.Tools.GpuConformance <path-to-exec-cs.spv>");
-    var code = File.ReadAllBytes(spvPath);
+    private const uint NvidiaVendorId = 0x10DE;
+    private const uint Gtx1070DeviceId = 0x1B81;
+    private const uint Sentinel = 0xCAFEBABE;
+    private const ulong BufferSize = 64;
+    private const ulong FenceTimeoutNanoseconds = 10_000_000_000;
+    private static readonly TimeSpan ProcessTimeout = TimeSpan.FromSeconds(15);
 
-    var vk = Vk.GetApi();
-
-    var appName = (byte*)SilkMarshal.StringToPtr("SharpEmuGpuConformance");
-    var appInfo = new ApplicationInfo
+    public static async Task<int> RunAsync(string[] args)
     {
-        SType = StructureType.ApplicationInfo,
-        PApplicationName = appName,
-        ApiVersion = Vk.Version13,
-    };
-    var instanceInfo = new InstanceCreateInfo
-    {
-        SType = StructureType.InstanceCreateInfo,
-        PApplicationInfo = &appInfo,
-    };
-    Check(vk.CreateInstance(in instanceInfo, null, out var instance), "vkCreateInstance");
-
-    uint deviceCount = 0;
-    vk.EnumeratePhysicalDevices(instance, &deviceCount, null);
-    if (deviceCount == 0)
-    {
-        Console.WriteLine("no Vulkan devices found");
-        return;
-    }
-
-    var physicalDevices = new PhysicalDevice[deviceCount];
-    fixed (PhysicalDevice* pDevices = physicalDevices)
-    {
-        vk.EnumeratePhysicalDevices(instance, &deviceCount, pDevices);
-    }
-
-    // Prefer the first discrete GPU; fall back to the first device.
-    var physical = physicalDevices[0];
-    foreach (var candidate in physicalDevices)
-    {
-        vk.GetPhysicalDeviceProperties(candidate, out var props);
-        if (props.DeviceType == PhysicalDeviceType.DiscreteGpu)
+        if (args.Length == 2 && args[0] == "--worker")
         {
-            physical = candidate;
-            break;
+            return RunWorker(args[1]);
         }
-    }
 
-    vk.GetPhysicalDeviceProperties(physical, out var chosenProps);
-    Console.WriteLine(
-        $"executing on: {SilkMarshal.PtrToString((nint)chosenProps.DeviceName)}");
-
-    uint familyCount = 0;
-    vk.GetPhysicalDeviceQueueFamilyProperties(physical, &familyCount, null);
-    var families = new QueueFamilyProperties[familyCount];
-    fixed (QueueFamilyProperties* pFamilies = families)
-    {
-        vk.GetPhysicalDeviceQueueFamilyProperties(physical, &familyCount, pFamilies);
-    }
-
-    uint? computeFamilyFound = null;
-    for (uint index = 0; index < familyCount; index++)
-    {
-        if (families[index].QueueFlags.HasFlag(QueueFlags.ComputeBit))
+        if (args.Length != 1 || args[0] is "-h" or "--help")
         {
-            computeFamilyFound = index;
-            break;
+            PrintUsage();
+            return args.Length == 1 ? 0 : 2;
         }
-    }
 
-    var computeFamily = computeFamilyFound
-        ?? throw new InvalidOperationException("device has no compute-capable queue family");
-
-    // The emitted SPIR-V declares the Int64 capability.
-    vk.GetPhysicalDeviceFeatures(physical, out var supportedFeatures);
-    if (!supportedFeatures.ShaderInt64)
-    {
-        throw new InvalidOperationException(
-            "device does not support shaderInt64, which the emitted SPIR-V requires");
-    }
-
-    var priority = 1f;
-    var queueInfo = new DeviceQueueCreateInfo
-    {
-        SType = StructureType.DeviceQueueCreateInfo,
-        QueueFamilyIndex = computeFamily,
-        QueueCount = 1,
-        PQueuePriorities = &priority,
-    };
-    var features = new PhysicalDeviceFeatures { ShaderInt64 = true };
-    var deviceInfo = new DeviceCreateInfo
-    {
-        SType = StructureType.DeviceCreateInfo,
-        QueueCreateInfoCount = 1,
-        PQueueCreateInfos = &queueInfo,
-        PEnabledFeatures = &features,
-    };
-    Check(vk.CreateDevice(physical, in deviceInfo, null, out var device), "vkCreateDevice");
-    vk.GetDeviceQueue(device, computeFamily, 0, out var queue);
-
-    // Storage buffer, host-visible so the CPU can prefill and read back.
-    var bufferInfo = new BufferCreateInfo
-    {
-        SType = StructureType.BufferCreateInfo,
-        Size = BufferSize,
-        Usage = BufferUsageFlags.StorageBufferBit,
-        SharingMode = SharingMode.Exclusive,
-    };
-    Check(vk.CreateBuffer(device, in bufferInfo, null, out var buffer), "vkCreateBuffer");
-    vk.GetBufferMemoryRequirements(device, buffer, out var requirements);
-    vk.GetPhysicalDeviceMemoryProperties(physical, out var memoryProperties);
-
-    uint memoryType = uint.MaxValue;
-    for (var index = 0; index < memoryProperties.MemoryTypeCount; index++)
-    {
-        var flags = memoryProperties.MemoryTypes[index].PropertyFlags;
-        if ((requirements.MemoryTypeBits & (1u << index)) != 0 &&
-            flags.HasFlag(MemoryPropertyFlags.HostVisibleBit) &&
-            flags.HasFlag(MemoryPropertyFlags.HostCoherentBit))
+        if (!IsExecFixture(args[0]))
         {
-            memoryType = (uint)index;
-            break;
+            Console.Error.WriteLine(
+                "ERROR: expected ShaderDump's synthetic exec-cs.spv fixture; other shader inputs are not accepted");
+            return 2;
         }
+
+        return await RunSupervisedWorkerAsync(args[0]);
     }
 
-    if (memoryType == uint.MaxValue)
+    private static async Task<int> RunSupervisedWorkerAsync(string shaderPath)
     {
-        throw new InvalidOperationException(
-            "no host-visible, host-coherent memory type available for the readback buffer");
-    }
-
-    var allocateInfo = new MemoryAllocateInfo
-    {
-        SType = StructureType.MemoryAllocateInfo,
-        AllocationSize = requirements.Size,
-        MemoryTypeIndex = memoryType,
-    };
-    Check(vk.AllocateMemory(device, in allocateInfo, null, out var memory), "vkAllocateMemory");
-    Check(vk.BindBufferMemory(device, buffer, memory, 0), "vkBindBufferMemory");
-
-    void* mapped;
-    Check(vk.MapMemory(device, memory, 0, BufferSize, 0, &mapped), "vkMapMemory");
-    var words = (uint*)mapped;
-    for (var index = 0; index < (int)(BufferSize / sizeof(uint)); index++)
-    {
-        words[index] = Sentinel;
-    }
-
-    // SharpEmu emits all guest buffers as one descriptor array at set 0,
-    // binding 0; this conformance shader uses a single buffer.
-    ShaderModule module;
-    fixed (byte* pCode = code)
-    {
-        var moduleInfo = new ShaderModuleCreateInfo
+        var processPath = Environment.ProcessPath;
+        if (string.IsNullOrWhiteSpace(processPath))
         {
-            SType = StructureType.ShaderModuleCreateInfo,
-            CodeSize = (nuint)code.Length,
-            PCode = (uint*)pCode,
+            Console.Error.WriteLine("ERROR: unable to locate the probe executable for supervised execution");
+            return 1;
+        }
+
+        using var worker = new Process
+        {
+            StartInfo = new ProcessStartInfo
+            {
+                FileName = processPath,
+                UseShellExecute = false,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+            },
         };
-        Check(vk.CreateShaderModule(device, in moduleInfo, null, out module), "vkCreateShaderModule");
-    }
+        worker.StartInfo.ArgumentList.Add("--worker");
+        worker.StartInfo.ArgumentList.Add(shaderPath);
 
-    var layoutBinding = new DescriptorSetLayoutBinding
-    {
-        Binding = 0,
-        DescriptorType = DescriptorType.StorageBuffer,
-        DescriptorCount = 1,
-        StageFlags = ShaderStageFlags.ComputeBit,
-    };
-    var setLayoutInfo = new DescriptorSetLayoutCreateInfo
-    {
-        SType = StructureType.DescriptorSetLayoutCreateInfo,
-        BindingCount = 1,
-        PBindings = &layoutBinding,
-    };
-    Check(
-        vk.CreateDescriptorSetLayout(device, in setLayoutInfo, null, out var setLayout),
-        "vkCreateDescriptorSetLayout");
-
-    var pipelineLayoutInfo = new PipelineLayoutCreateInfo
-    {
-        SType = StructureType.PipelineLayoutCreateInfo,
-        SetLayoutCount = 1,
-        PSetLayouts = &setLayout,
-    };
-    Check(
-        vk.CreatePipelineLayout(device, in pipelineLayoutInfo, null, out var pipelineLayout),
-        "vkCreatePipelineLayout");
-
-    var entryName = (byte*)SilkMarshal.StringToPtr("main");
-    var pipelineInfo = new ComputePipelineCreateInfo
-    {
-        SType = StructureType.ComputePipelineCreateInfo,
-        Stage = new PipelineShaderStageCreateInfo
+        try
         {
-            SType = StructureType.PipelineShaderStageCreateInfo,
-            Stage = ShaderStageFlags.ComputeBit,
-            Module = module,
-            PName = entryName,
-        },
-        Layout = pipelineLayout,
-    };
-    Check(
-        vk.CreateComputePipelines(device, default, 1, in pipelineInfo, null, out var pipeline),
-        "vkCreateComputePipelines");
-    Console.WriteLine("driver accepted the SPIR-V (pipeline created)");
-
-    var poolSize = new DescriptorPoolSize
-    {
-        Type = DescriptorType.StorageBuffer,
-        DescriptorCount = 1,
-    };
-    var poolInfo = new DescriptorPoolCreateInfo
-    {
-        SType = StructureType.DescriptorPoolCreateInfo,
-        MaxSets = 1,
-        PoolSizeCount = 1,
-        PPoolSizes = &poolSize,
-    };
-    Check(vk.CreateDescriptorPool(device, in poolInfo, null, out var pool), "vkCreateDescriptorPool");
-
-    var setAllocateInfo = new DescriptorSetAllocateInfo
-    {
-        SType = StructureType.DescriptorSetAllocateInfo,
-        DescriptorPool = pool,
-        DescriptorSetCount = 1,
-        PSetLayouts = &setLayout,
-    };
-    Check(vk.AllocateDescriptorSets(device, in setAllocateInfo, out var descriptorSet), "vkAllocateDescriptorSets");
-
-    var descriptorBuffer = new DescriptorBufferInfo
-    {
-        Buffer = buffer,
-        Offset = 0,
-        Range = BufferSize,
-    };
-    var write = new WriteDescriptorSet
-    {
-        SType = StructureType.WriteDescriptorSet,
-        DstSet = descriptorSet,
-        DstBinding = 0,
-        DstArrayElement = 0,
-        DescriptorCount = 1,
-        DescriptorType = DescriptorType.StorageBuffer,
-        PBufferInfo = &descriptorBuffer,
-    };
-    vk.UpdateDescriptorSets(device, 1, in write, 0, null);
-
-    var commandPoolInfo = new CommandPoolCreateInfo
-    {
-        SType = StructureType.CommandPoolCreateInfo,
-        QueueFamilyIndex = computeFamily,
-    };
-    Check(vk.CreateCommandPool(device, in commandPoolInfo, null, out var commandPool), "vkCreateCommandPool");
-
-    var commandBufferInfo = new CommandBufferAllocateInfo
-    {
-        SType = StructureType.CommandBufferAllocateInfo,
-        CommandPool = commandPool,
-        Level = CommandBufferLevel.Primary,
-        CommandBufferCount = 1,
-    };
-    Check(vk.AllocateCommandBuffers(device, in commandBufferInfo, out var commandBuffer), "vkAllocateCommandBuffers");
-
-    var beginInfo = new CommandBufferBeginInfo
-    {
-        SType = StructureType.CommandBufferBeginInfo,
-    };
-    Check(vk.BeginCommandBuffer(commandBuffer, in beginInfo), "vkBeginCommandBuffer");
-    vk.CmdBindPipeline(commandBuffer, PipelineBindPoint.Compute, pipeline);
-    vk.CmdBindDescriptorSets(
-        commandBuffer,
-        PipelineBindPoint.Compute,
-        pipelineLayout,
-        0,
-        1,
-        in descriptorSet,
-        0,
-        null);
-    vk.CmdDispatch(commandBuffer, 1, 1, 1);
-    var barrier = new MemoryBarrier
-    {
-        SType = StructureType.MemoryBarrier,
-        SrcAccessMask = AccessFlags.ShaderWriteBit,
-        DstAccessMask = AccessFlags.HostReadBit,
-    };
-    vk.CmdPipelineBarrier(
-        commandBuffer,
-        PipelineStageFlags.ComputeShaderBit,
-        PipelineStageFlags.HostBit,
-        0,
-        1,
-        in barrier,
-        0,
-        null,
-        0,
-        null);
-    Check(vk.EndCommandBuffer(commandBuffer), "vkEndCommandBuffer");
-
-    var submitInfo = new SubmitInfo
-    {
-        SType = StructureType.SubmitInfo,
-        CommandBufferCount = 1,
-        PCommandBuffers = &commandBuffer,
-    };
-    Check(vk.QueueSubmit(queue, 1, in submitInfo, default), "vkQueueSubmit");
-    Check(vk.QueueWaitIdle(queue), "vkQueueWaitIdle");
-
-    var results = new (string Name, uint Actual, uint Expected)[]
-    {
-        ("v_fmac_f32  fma(1.5, 2.25, 10.0)", words[0], expectedFma),
-        ("v_mul_hi_i32 hi(0x7FFFFFFF*0x10003)", words[1], expectedHi),
-        ("v_mul_lo_i32 lo(0x7FFFFFFF*0x10003)", words[2], expectedLo),
-        ("exec=0 store suppressed (offset 12 sentinel)", words[3], Sentinel),
-        ("store after exec restore (offset 16)", words[4], expectedRestored),
-    };
-    var failures = 0;
-    foreach (var (name, actual, expected) in results)
-    {
-        var status = actual == expected ? "PASS" : "FAIL";
-        if (actual != expected)
+            if (!worker.Start())
+            {
+                Console.Error.WriteLine("ERROR: failed to start the supervised Vulkan worker");
+                return 1;
+            }
+        }
+        catch (Exception exception) when (exception is InvalidOperationException or System.ComponentModel.Win32Exception)
         {
-            failures++;
+            Console.Error.WriteLine(
+                $"ERROR: failed to start the supervised Vulkan worker ({exception.GetType().Name})");
+            return 1;
         }
 
-        Console.WriteLine($"{status}  {name}: gpu=0x{actual:X8} expected=0x{expected:X8}");
+        var stdoutTask = worker.StandardOutput.ReadToEndAsync();
+        var stderrTask = worker.StandardError.ReadToEndAsync();
+        using var timeout = new CancellationTokenSource(ProcessTimeout);
+
+        try
+        {
+            await worker.WaitForExitAsync(timeout.Token);
+        }
+        catch (OperationCanceledException)
+        {
+            try
+            {
+                worker.Kill(entireProcessTree: true);
+                await worker.WaitForExitAsync();
+            }
+            catch (InvalidOperationException)
+            {
+                // The process exited between the timeout and the kill request.
+            }
+
+            WriteWorkerOutput(await stdoutTask, await stderrTask);
+            Console.Error.WriteLine(
+                "ERROR: Vulkan probe exceeded the 15 second limit; worker terminated and process resources were reclaimed");
+            return 124;
+        }
+
+        WriteWorkerOutput(await stdoutTask, await stderrTask);
+        return worker.ExitCode;
     }
 
-    var totalWords = (int)(BufferSize / sizeof(uint));
-    var trailingClobbered = 0;
-    for (var index = results.Length; index < totalWords; index++)
+    private static int RunWorker(string shaderPath)
     {
-        if (words[index] != Sentinel)
+        try
         {
-            trailingClobbered++;
+            var code = ReadExecFixture(shaderPath);
+            return RunVulkan(code);
+        }
+        catch (ProbeFailureException exception)
+        {
+            Console.Error.WriteLine($"ERROR: {exception.Message}");
+            return 1;
+        }
+        catch (DllNotFoundException)
+        {
+            Console.Error.WriteLine(
+                "ERROR: Vulkan loader unavailable; install a Vulkan-capable NVIDIA driver and loader");
+            return 1;
+        }
+        catch (Exception exception)
+        {
+            Console.Error.WriteLine(
+                $"ERROR: unexpected Vulkan probe failure ({exception.GetType().Name}); rerun with a current NVIDIA driver");
+            return 1;
+        }
+    }
+
+    private static byte[] ReadExecFixture(string shaderPath)
+    {
+        if (!IsExecFixture(shaderPath))
+        {
+            throw new ProbeFailureException(
+                "expected ShaderDump's synthetic exec-cs.spv fixture; other shader inputs are not accepted");
+        }
+
+        byte[] code;
+        try
+        {
+            code = File.ReadAllBytes(shaderPath);
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+        {
+            throw new ProbeFailureException(
+                $"could not read the synthetic exec-cs.spv fixture ({exception.GetType().Name})");
+        }
+
+        if (code.Length < sizeof(uint) || code.Length % sizeof(uint) != 0 ||
+            BitConverter.ToUInt32(code) != 0x07230203)
+        {
+            throw new ProbeFailureException(
+                "synthetic exec-cs.spv is not a complete SPIR-V module; regenerate it with ShaderDump");
+        }
+
+        Console.WriteLine($"fixture: synthetic exec-cs.spv ({code.Length} bytes)");
+        return code;
+    }
+
+    private static unsafe int RunVulkan(byte[] code)
+    {
+        Vk vk;
+        try
+        {
+            vk = Vk.GetApi();
+        }
+        catch (Exception exception) when (exception is DllNotFoundException or TypeInitializationException)
+        {
+            throw new ProbeFailureException(
+                "Vulkan loader unavailable; install a Vulkan-capable NVIDIA driver and loader");
+        }
+
+        using (vk)
+        {
+            Instance instance = default;
+            Device device = default;
+            VulkanBuffer buffer = default;
+            DeviceMemory memory = default;
+            ShaderModule module = default;
+            DescriptorSetLayout setLayout = default;
+            PipelineLayout pipelineLayout = default;
+            Pipeline pipeline = default;
+            DescriptorPool descriptorPool = default;
+            CommandPool commandPool = default;
+            Fence fence = default;
+            void* mapped = null;
+            nint appName = 0;
+            nint entryName = 0;
+            var queueSubmitted = false;
+            var queueCompleted = false;
+
+            try
+            {
+                appName = SilkMarshal.StringToPtr("SharpEmuNvidiaVulkanProbe");
+                var appInfo = new ApplicationInfo
+                {
+                    SType = StructureType.ApplicationInfo,
+                    PApplicationName = (byte*)appName,
+                    ApiVersion = Vk.Version12,
+                };
+                var instanceInfo = new InstanceCreateInfo
+                {
+                    SType = StructureType.InstanceCreateInfo,
+                    PApplicationInfo = &appInfo,
+                };
+                Check(vk.CreateInstance(in instanceInfo, null, out instance), "vkCreateInstance");
+
+                var (physical, properties) = SelectNvidiaDevice(vk, instance);
+                var deviceName = SilkMarshal.PtrToString((nint)properties.DeviceName) ?? "unknown";
+                Console.WriteLine(
+                    $"device: name={deviceName}; api={FormatApiVersion(properties.ApiVersion)}; " +
+                    $"vendor=0x{properties.VendorID:X4}; device=0x{properties.DeviceID:X4}; " +
+                    $"driver={FormatDriverVersion(properties.DriverVersion)} (0x{properties.DriverVersion:X8})");
+
+                var (computeFamily, queueFlags) = SelectComputeQueue(vk, physical);
+                Console.WriteLine(
+                    $"queue: family={computeFamily}; index=0; flags={queueFlags}");
+
+                vk.GetPhysicalDeviceFeatures(physical, out var supportedFeatures);
+                if (!supportedFeatures.ShaderInt64)
+                {
+                    throw new ProbeFailureException(
+                        "selected NVIDIA device lacks shaderInt64 required by the emitted SPIR-V");
+                }
+
+                var priority = 1f;
+                var queueInfo = new DeviceQueueCreateInfo
+                {
+                    SType = StructureType.DeviceQueueCreateInfo,
+                    QueueFamilyIndex = computeFamily,
+                    QueueCount = 1,
+                    PQueuePriorities = &priority,
+                };
+                var features = new PhysicalDeviceFeatures { ShaderInt64 = true };
+                var deviceInfo = new DeviceCreateInfo
+                {
+                    SType = StructureType.DeviceCreateInfo,
+                    QueueCreateInfoCount = 1,
+                    PQueueCreateInfos = &queueInfo,
+                    PEnabledFeatures = &features,
+                };
+                Check(vk.CreateDevice(physical, in deviceInfo, null, out device), "vkCreateDevice");
+                vk.GetDeviceQueue(device, computeFamily, 0, out var queue);
+
+                var bufferInfo = new BufferCreateInfo
+                {
+                    SType = StructureType.BufferCreateInfo,
+                    Size = BufferSize,
+                    Usage = BufferUsageFlags.StorageBufferBit,
+                    SharingMode = SharingMode.Exclusive,
+                };
+                Check(vk.CreateBuffer(device, in bufferInfo, null, out buffer), "vkCreateBuffer");
+                vk.GetBufferMemoryRequirements(device, buffer, out var requirements);
+                vk.GetPhysicalDeviceMemoryProperties(physical, out var memoryProperties);
+
+                var memoryType = FindReadbackMemoryType(requirements, memoryProperties);
+                var allocateInfo = new MemoryAllocateInfo
+                {
+                    SType = StructureType.MemoryAllocateInfo,
+                    AllocationSize = requirements.Size,
+                    MemoryTypeIndex = memoryType,
+                };
+                Check(vk.AllocateMemory(device, in allocateInfo, null, out memory), "vkAllocateMemory");
+                Check(vk.BindBufferMemory(device, buffer, memory, 0), "vkBindBufferMemory");
+                Check(vk.MapMemory(device, memory, 0, BufferSize, 0, &mapped), "vkMapMemory");
+
+                var words = (uint*)mapped;
+                for (var index = 0; index < (int)(BufferSize / sizeof(uint)); index++)
+                {
+                    words[index] = Sentinel;
+                }
+
+                fixed (byte* pCode = code)
+                {
+                    var moduleInfo = new ShaderModuleCreateInfo
+                    {
+                        SType = StructureType.ShaderModuleCreateInfo,
+                        CodeSize = (nuint)code.Length,
+                        PCode = (uint*)pCode,
+                    };
+                    Check(
+                        vk.CreateShaderModule(device, in moduleInfo, null, out module),
+                        "vkCreateShaderModule");
+                }
+
+                var layoutBinding = new DescriptorSetLayoutBinding
+                {
+                    Binding = 0,
+                    DescriptorType = DescriptorType.StorageBuffer,
+                    DescriptorCount = 1,
+                    StageFlags = ShaderStageFlags.ComputeBit,
+                };
+                var setLayoutInfo = new DescriptorSetLayoutCreateInfo
+                {
+                    SType = StructureType.DescriptorSetLayoutCreateInfo,
+                    BindingCount = 1,
+                    PBindings = &layoutBinding,
+                };
+                Check(
+                    vk.CreateDescriptorSetLayout(device, in setLayoutInfo, null, out setLayout),
+                    "vkCreateDescriptorSetLayout");
+
+                var pipelineLayoutInfo = new PipelineLayoutCreateInfo
+                {
+                    SType = StructureType.PipelineLayoutCreateInfo,
+                    SetLayoutCount = 1,
+                    PSetLayouts = &setLayout,
+                };
+                Check(
+                    vk.CreatePipelineLayout(device, in pipelineLayoutInfo, null, out pipelineLayout),
+                    "vkCreatePipelineLayout");
+
+                entryName = SilkMarshal.StringToPtr("main");
+                var pipelineInfo = new ComputePipelineCreateInfo
+                {
+                    SType = StructureType.ComputePipelineCreateInfo,
+                    Stage = new PipelineShaderStageCreateInfo
+                    {
+                        SType = StructureType.PipelineShaderStageCreateInfo,
+                        Stage = ShaderStageFlags.ComputeBit,
+                        Module = module,
+                        PName = (byte*)entryName,
+                    },
+                    Layout = pipelineLayout,
+                };
+                Check(
+                    vk.CreateComputePipelines(
+                        device,
+                        default,
+                        1,
+                        in pipelineInfo,
+                        null,
+                        out pipeline),
+                    "vkCreateComputePipelines");
+                Console.WriteLine("pipeline: NVIDIA driver accepted the synthetic SPIR-V");
+
+                var poolSize = new DescriptorPoolSize
+                {
+                    Type = DescriptorType.StorageBuffer,
+                    DescriptorCount = 1,
+                };
+                var poolInfo = new DescriptorPoolCreateInfo
+                {
+                    SType = StructureType.DescriptorPoolCreateInfo,
+                    MaxSets = 1,
+                    PoolSizeCount = 1,
+                    PPoolSizes = &poolSize,
+                };
+                Check(
+                    vk.CreateDescriptorPool(device, in poolInfo, null, out descriptorPool),
+                    "vkCreateDescriptorPool");
+
+                var setAllocateInfo = new DescriptorSetAllocateInfo
+                {
+                    SType = StructureType.DescriptorSetAllocateInfo,
+                    DescriptorPool = descriptorPool,
+                    DescriptorSetCount = 1,
+                    PSetLayouts = &setLayout,
+                };
+                Check(
+                    vk.AllocateDescriptorSets(device, in setAllocateInfo, out var descriptorSet),
+                    "vkAllocateDescriptorSets");
+
+                var descriptorBuffer = new DescriptorBufferInfo
+                {
+                    Buffer = buffer,
+                    Offset = 0,
+                    Range = BufferSize,
+                };
+                var write = new WriteDescriptorSet
+                {
+                    SType = StructureType.WriteDescriptorSet,
+                    DstSet = descriptorSet,
+                    DstBinding = 0,
+                    DescriptorCount = 1,
+                    DescriptorType = DescriptorType.StorageBuffer,
+                    PBufferInfo = &descriptorBuffer,
+                };
+                vk.UpdateDescriptorSets(device, 1, in write, 0, null);
+
+                var commandPoolInfo = new CommandPoolCreateInfo
+                {
+                    SType = StructureType.CommandPoolCreateInfo,
+                    QueueFamilyIndex = computeFamily,
+                };
+                Check(
+                    vk.CreateCommandPool(device, in commandPoolInfo, null, out commandPool),
+                    "vkCreateCommandPool");
+
+                var commandBufferInfo = new CommandBufferAllocateInfo
+                {
+                    SType = StructureType.CommandBufferAllocateInfo,
+                    CommandPool = commandPool,
+                    Level = CommandBufferLevel.Primary,
+                    CommandBufferCount = 1,
+                };
+                Check(
+                    vk.AllocateCommandBuffers(device, in commandBufferInfo, out var commandBuffer),
+                    "vkAllocateCommandBuffers");
+
+                var beginInfo = new CommandBufferBeginInfo
+                {
+                    SType = StructureType.CommandBufferBeginInfo,
+                };
+                Check(vk.BeginCommandBuffer(commandBuffer, in beginInfo), "vkBeginCommandBuffer");
+                vk.CmdBindPipeline(commandBuffer, PipelineBindPoint.Compute, pipeline);
+                vk.CmdBindDescriptorSets(
+                    commandBuffer,
+                    PipelineBindPoint.Compute,
+                    pipelineLayout,
+                    0,
+                    1,
+                    in descriptorSet,
+                    0,
+                    null);
+                vk.CmdDispatch(commandBuffer, 1, 1, 1);
+
+                var barrier = new MemoryBarrier
+                {
+                    SType = StructureType.MemoryBarrier,
+                    SrcAccessMask = AccessFlags.ShaderWriteBit,
+                    DstAccessMask = AccessFlags.HostReadBit,
+                };
+                vk.CmdPipelineBarrier(
+                    commandBuffer,
+                    PipelineStageFlags.ComputeShaderBit,
+                    PipelineStageFlags.HostBit,
+                    0,
+                    1,
+                    in barrier,
+                    0,
+                    null,
+                    0,
+                    null);
+                Check(vk.EndCommandBuffer(commandBuffer), "vkEndCommandBuffer");
+
+                var fenceInfo = new FenceCreateInfo
+                {
+                    SType = StructureType.FenceCreateInfo,
+                };
+                Check(vk.CreateFence(device, in fenceInfo, null, out fence), "vkCreateFence");
+
+                var submitInfo = new SubmitInfo
+                {
+                    SType = StructureType.SubmitInfo,
+                    CommandBufferCount = 1,
+                    PCommandBuffers = &commandBuffer,
+                };
+                Check(vk.QueueSubmit(queue, 1, in submitInfo, fence), "vkQueueSubmit");
+                queueSubmitted = true;
+
+                var waitResult = vk.WaitForFences(
+                    device,
+                    1,
+                    in fence,
+                    true,
+                    FenceTimeoutNanoseconds);
+                if (waitResult == Result.Timeout)
+                {
+                    throw new ProbeFailureException(
+                        "compute dispatch exceeded the 10 second GPU fence timeout");
+                }
+
+                Check(waitResult, "vkWaitForFences");
+                queueCompleted = true;
+                Console.WriteLine("dispatch: completed within 10 second GPU timeout");
+
+                return VerifyReadback(words);
+            }
+            finally
+            {
+                if (device.Handle != 0 && queueSubmitted && !queueCompleted)
+                {
+                    _ = vk.DeviceWaitIdle(device);
+                }
+
+                if (device.Handle != 0 && fence.Handle != 0)
+                {
+                    vk.DestroyFence(device, fence, null);
+                }
+
+                if (device.Handle != 0 && commandPool.Handle != 0)
+                {
+                    vk.DestroyCommandPool(device, commandPool, null);
+                }
+
+                if (device.Handle != 0 && descriptorPool.Handle != 0)
+                {
+                    vk.DestroyDescriptorPool(device, descriptorPool, null);
+                }
+
+                if (device.Handle != 0 && pipeline.Handle != 0)
+                {
+                    vk.DestroyPipeline(device, pipeline, null);
+                }
+
+                if (device.Handle != 0 && pipelineLayout.Handle != 0)
+                {
+                    vk.DestroyPipelineLayout(device, pipelineLayout, null);
+                }
+
+                if (device.Handle != 0 && setLayout.Handle != 0)
+                {
+                    vk.DestroyDescriptorSetLayout(device, setLayout, null);
+                }
+
+                if (device.Handle != 0 && module.Handle != 0)
+                {
+                    vk.DestroyShaderModule(device, module, null);
+                }
+
+                if (device.Handle != 0 && mapped != null)
+                {
+                    vk.UnmapMemory(device, memory);
+                }
+
+                if (device.Handle != 0 && buffer.Handle != 0)
+                {
+                    vk.DestroyBuffer(device, buffer, null);
+                }
+
+                if (device.Handle != 0 && memory.Handle != 0)
+                {
+                    vk.FreeMemory(device, memory, null);
+                }
+
+                if (device.Handle != 0)
+                {
+                    vk.DestroyDevice(device, null);
+                }
+
+                if (instance.Handle != 0)
+                {
+                    vk.DestroyInstance(instance, null);
+                }
+
+                if (entryName != 0)
+                {
+                    SilkMarshal.Free(entryName);
+                }
+
+                if (appName != 0)
+                {
+                    SilkMarshal.Free(appName);
+                }
+
+                Console.WriteLine("cleanup: complete");
+            }
+        }
+    }
+
+    private static unsafe (PhysicalDevice Device, PhysicalDeviceProperties Properties) SelectNvidiaDevice(
+        Vk vk,
+        Instance instance)
+    {
+        uint deviceCount = 0;
+        Check(
+            vk.EnumeratePhysicalDevices(instance, &deviceCount, null),
+            "vkEnumeratePhysicalDevices(count)");
+        if (deviceCount == 0)
+        {
+            throw new ProbeFailureException(
+                "no Vulkan devices found; verify the NVIDIA Vulkan driver installation");
+        }
+
+        var physicalDevices = new PhysicalDevice[deviceCount];
+        fixed (PhysicalDevice* pDevices = physicalDevices)
+        {
+            Check(
+                vk.EnumeratePhysicalDevices(instance, &deviceCount, pDevices),
+                "vkEnumeratePhysicalDevices(list)");
+        }
+
+        PhysicalDevice selected = default;
+        PhysicalDeviceProperties selectedProperties = default;
+        foreach (var candidate in physicalDevices)
+        {
+            vk.GetPhysicalDeviceProperties(candidate, out var properties);
+            if (properties.VendorID != NvidiaVendorId)
+            {
+                continue;
+            }
+
+            selected = candidate;
+            selectedProperties = properties;
+            if (properties.DeviceID == Gtx1070DeviceId)
+            {
+                break;
+            }
+        }
+
+        if (selected.Handle == 0)
+        {
+            throw new ProbeFailureException(
+                "no NVIDIA Vulkan device found (vendor 0x10DE); software and non-NVIDIA devices are intentionally rejected");
+        }
+
+        return (selected, selectedProperties);
+    }
+
+    private static unsafe (uint Family, QueueFlags Flags) SelectComputeQueue(
+        Vk vk,
+        PhysicalDevice physical)
+    {
+        uint familyCount = 0;
+        vk.GetPhysicalDeviceQueueFamilyProperties(physical, &familyCount, null);
+        if (familyCount == 0)
+        {
+            throw new ProbeFailureException("selected NVIDIA device reports no queue families");
+        }
+
+        var families = new QueueFamilyProperties[familyCount];
+        fixed (QueueFamilyProperties* pFamilies = families)
+        {
+            vk.GetPhysicalDeviceQueueFamilyProperties(physical, &familyCount, pFamilies);
+        }
+
+        uint? fallback = null;
+        for (uint index = 0; index < familyCount; index++)
+        {
+            var family = families[index];
+            if (family.QueueCount == 0 || !family.QueueFlags.HasFlag(QueueFlags.ComputeBit))
+            {
+                continue;
+            }
+
+            fallback ??= index;
+            if (!family.QueueFlags.HasFlag(QueueFlags.GraphicsBit))
+            {
+                return (index, family.QueueFlags);
+            }
+        }
+
+        if (fallback is uint computeFamily)
+        {
+            return (computeFamily, families[computeFamily].QueueFlags);
+        }
+
+        throw new ProbeFailureException(
+            "selected NVIDIA device has no compute-capable queue family");
+    }
+
+    private static uint FindReadbackMemoryType(
+        MemoryRequirements requirements,
+        PhysicalDeviceMemoryProperties memoryProperties)
+    {
+        for (var index = 0; index < memoryProperties.MemoryTypeCount; index++)
+        {
+            var flags = memoryProperties.MemoryTypes[index].PropertyFlags;
+            if ((requirements.MemoryTypeBits & (1u << index)) != 0 &&
+                flags.HasFlag(MemoryPropertyFlags.HostVisibleBit) &&
+                flags.HasFlag(MemoryPropertyFlags.HostCoherentBit))
+            {
+                return (uint)index;
+            }
+        }
+
+        throw new ProbeFailureException(
+            "selected NVIDIA device has no host-visible, host-coherent memory for readback");
+    }
+
+    private static unsafe int VerifyReadback(uint* words)
+    {
+        var expectedFma = BitConverter.SingleToUInt32Bits(
+            MathF.FusedMultiplyAdd(1.5f, 2.25f, 10.0f));
+        var product = (long)0x7FFFFFFF * 0x00010003;
+        var expectedHi = (uint)(product >> 32);
+        var expectedLo = (uint)product;
+        var expectedRestored = BitConverter.SingleToUInt32Bits(1.5f);
+
+        var results = new (string Name, uint Actual, uint Expected)[]
+        {
+            ("v_fmac_f32", words[0], expectedFma),
+            ("v_mul_hi_i32", words[1], expectedHi),
+            ("v_mul_lo_i32", words[2], expectedLo),
+            ("exec=0 store suppressed", words[3], Sentinel),
+            ("store after exec restore", words[4], expectedRestored),
+        };
+
+        var failures = 0;
+        foreach (var (name, actual, expected) in results)
+        {
+            var passed = actual == expected;
+            failures += passed ? 0 : 1;
             Console.WriteLine(
-                $"FAIL  trailing word [{index}] clobbered: gpu=0x{words[index]:X8} expected=0x{Sentinel:X8}");
+                $"readback: {(passed ? "PASS" : "FAIL")} {name}; actual=0x{actual:X8}; expected=0x{expected:X8}");
         }
+
+        var totalWords = (int)(BufferSize / sizeof(uint));
+        for (var index = results.Length; index < totalWords; index++)
+        {
+            if (words[index] == Sentinel)
+            {
+                continue;
+            }
+
+            failures++;
+            Console.WriteLine(
+                $"readback: FAIL trailing word {index}; actual=0x{words[index]:X8}; expected=0x{Sentinel:X8}");
+        }
+
+        if (failures == 0)
+        {
+            Console.WriteLine(
+                $"readback: PASS trailing words {results.Length}..{totalWords - 1} preserved sentinel");
+            Console.WriteLine("RESULT: NVIDIA Vulkan exec fixture passed");
+            return 0;
+        }
+
+        Console.WriteLine($"RESULT: FAIL with {failures} readback mismatch(es)");
+        return 1;
     }
 
-    failures += trailingClobbered;
-    if (trailingClobbered == 0)
-    {
-        Console.WriteLine(
-            $"PASS  trailing words [{results.Length}..{totalWords - 1}] intact (sentinel)");
-    }
-
-    Console.WriteLine(failures == 0
-        ? "RESULT: all values match"
-        : $"RESULT: {failures} mismatch(es)");
-
-    vk.DestroyCommandPool(device, commandPool, null);
-    vk.DestroyDescriptorPool(device, pool, null);
-    vk.DestroyPipeline(device, pipeline, null);
-    vk.DestroyPipelineLayout(device, pipelineLayout, null);
-    vk.DestroyDescriptorSetLayout(device, setLayout, null);
-    vk.DestroyShaderModule(device, module, null);
-    vk.UnmapMemory(device, memory);
-    vk.FreeMemory(device, memory, null);
-    vk.DestroyBuffer(device, buffer, null);
-    vk.DestroyDevice(device, null);
-    vk.DestroyInstance(instance, null);
-
-    Environment.ExitCode = failures == 0 ? 0 : 1;
-
-    static void Check(Result result, string what)
+    private static void Check(Result result, string operation)
     {
         if (result != Result.Success)
         {
-            throw new InvalidOperationException($"{what} failed: {result}");
+            throw new ProbeFailureException($"{operation} failed ({result})");
         }
     }
+
+    private static bool IsExecFixture(string path) =>
+        string.Equals(
+            Path.GetFileName(path),
+            "exec-cs.spv",
+            StringComparison.OrdinalIgnoreCase);
+
+    private static string FormatApiVersion(uint version) =>
+        $"{(version >> 22) & 0x7F}.{(version >> 12) & 0x3FF}.{version & 0xFFF}";
+
+    private static string FormatDriverVersion(uint version) =>
+        $"{version >> 22}.{(version >> 14) & 0xFF}.{(version >> 6) & 0xFF}.{version & 0x3F}";
+
+    private static void PrintUsage()
+    {
+        Console.WriteLine(
+            "usage: SharpEmu.Tools.GpuConformance <ShaderDump-output/exec-cs.spv>");
+        Console.WriteLine(
+            "Runs only the synthetic exec compute fixture on an NVIDIA Vulkan device; maximum duration is 15 seconds.");
+    }
+
+    private static void WriteWorkerOutput(string stdout, string stderr)
+    {
+        if (stdout.Length != 0)
+        {
+            Console.Out.Write(stdout);
+        }
+
+        if (stderr.Length != 0)
+        {
+            Console.Error.Write(stderr);
+        }
+    }
+
+    private sealed class ProbeFailureException(string message) : Exception(message);
 }
