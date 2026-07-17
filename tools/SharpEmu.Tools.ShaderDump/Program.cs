@@ -140,6 +140,34 @@ const ulong ProgramAddress = 0x100000;
         0xE0700010, 0x80020000, // buffer_store_dword v0, off, s[8:11], 0 offset:16
         0xBF810000,             // s_endpgm
     ]),
+    // Exact non-maximum clamp cases for the opt-in NVIDIA probe. The first seven
+    // dwords are initialized by the probe; GLC returns are stored at dwords
+    // 8..13, and the EXEC-disabled atomic targets dword 6.
+    ("atomic-clamp", ProgramExpectation.Translates, [
+        0x7E0202FF, 0x00000005, // v_mov_b32 v1, 5
+        0xE0F04000, 0x80020100, // buffer_atomic_inc v1, off, s[8:11], 0 glc
+        0xE0700020, 0x80020100, // buffer_store_dword v1, off, s[8:11], 0 offset:32
+        0x7E0202FF, 0x00000005, // v_mov_b32 v1, 5
+        0xE0F04004, 0x80020100, // buffer_atomic_inc ... offset:4 glc
+        0xE0700024, 0x80020100, // buffer_store_dword ... offset:36
+        0x7E0202FF, 0x00000005, // v_mov_b32 v1, 5
+        0xE0F04008, 0x80020100, // buffer_atomic_inc ... offset:8 glc
+        0xE0700028, 0x80020100, // buffer_store_dword ... offset:40
+        0x7E0202FF, 0x00000005, // v_mov_b32 v1, 5
+        0xE0F4400C, 0x80020100, // buffer_atomic_dec ... offset:12 glc
+        0xE070002C, 0x80020100, // buffer_store_dword ... offset:44
+        0x7E0202FF, 0x00000005, // v_mov_b32 v1, 5
+        0xE0F44010, 0x80020100, // buffer_atomic_dec ... offset:16 glc
+        0xE0700030, 0x80020100, // buffer_store_dword ... offset:48
+        0x7E0202FF, 0x00000005, // v_mov_b32 v1, 5
+        0xE0F44014, 0x80020100, // buffer_atomic_dec ... offset:20 glc
+        0xE0700034, 0x80020100, // buffer_store_dword ... offset:52
+        0xBEFE0380,             // s_mov_b32 exec_lo, 0
+        0x7E0202FF, 0x00000005, // v_mov_b32 v1, 5
+        0xE0F04018, 0x80020100, // buffer_atomic_inc ... offset:24 glc (masked)
+        0xBEFE03C1,             // s_mov_b32 exec_lo, -1
+        0xBF810000,             // s_endpgm
+    ]),
 ];
 
 var outputDirectory = args.Length > 0
@@ -182,27 +210,28 @@ foreach (var (name, expectation, words) in testPrograms)
         continue;
     }
 
-    // Buffer stores need a global-memory binding; the emitter resolves them by
-    // instruction PC, so collect store PCs from the decoded program itself.
-    var storePcs = new List<uint>();
+    // Buffer writes need a global-memory binding; the emitter resolves them by
+    // instruction PC, so collect store and atomic PCs from the decoded program.
+    var bufferWritePcs = new List<uint>();
     foreach (var instruction in program!.Instructions)
     {
-        if (instruction.Opcode.StartsWith("BufferStore", StringComparison.Ordinal))
+        if (instruction.Opcode.StartsWith("BufferStore", StringComparison.Ordinal) ||
+            instruction.Opcode.StartsWith("BufferAtomic", StringComparison.Ordinal))
         {
-            storePcs.Add(instruction.Pc);
+            bufferWritePcs.Add(instruction.Pc);
         }
     }
 
     // The binding's scalar base (8 -> s[8:11]) must match the srsrc field of
-    // the hand-assembled buffer_store words, and the 64-byte backing store
+    // the hand-assembled buffer write words, and the 64-byte backing store
     // must cover every hand-assembled store offset.
-    var globalBindings = storePcs.Count > 0
+    var globalBindings = bufferWritePcs.Count > 0
         ? new[]
         {
             new Gen5GlobalMemoryBinding(
                 8u,
                 0UL,
-                storePcs,
+                bufferWritePcs,
                 new byte[64],
                 64,
                 false),

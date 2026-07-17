@@ -30,10 +30,10 @@ internal static class NvidiaVulkanProbe
             return args.Length == 1 ? 0 : 2;
         }
 
-        if (!IsExecFixture(args[0]))
+        if (!TryGetFixture(args[0], out _))
         {
             Console.Error.WriteLine(
-                "ERROR: expected ShaderDump's synthetic exec-cs.spv fixture; other shader inputs are not accepted");
+                "ERROR: expected ShaderDump's synthetic exec-cs.spv or atomic-clamp-cs.spv fixture; other shader inputs are not accepted");
             return 2;
         }
 
@@ -111,8 +111,8 @@ internal static class NvidiaVulkanProbe
     {
         try
         {
-            var code = ReadExecFixture(shaderPath);
-            return RunVulkan(code);
+            var (code, fixture) = ReadFixture(shaderPath);
+            return RunVulkan(code, fixture);
         }
         catch (ProbeFailureException exception)
         {
@@ -133,13 +133,15 @@ internal static class NvidiaVulkanProbe
         }
     }
 
-    private static byte[] ReadExecFixture(string shaderPath)
+    private static (byte[] Code, ProbeFixture Fixture) ReadFixture(string shaderPath)
     {
-        if (!IsExecFixture(shaderPath))
+        if (!TryGetFixture(shaderPath, out var fixture))
         {
             throw new ProbeFailureException(
-                "expected ShaderDump's synthetic exec-cs.spv fixture; other shader inputs are not accepted");
+                "expected ShaderDump's synthetic exec-cs.spv or atomic-clamp-cs.spv fixture; other shader inputs are not accepted");
         }
+
+        var fixtureName = Path.GetFileName(shaderPath);
 
         byte[] code;
         try
@@ -149,21 +151,21 @@ internal static class NvidiaVulkanProbe
         catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
         {
             throw new ProbeFailureException(
-                $"could not read the synthetic exec-cs.spv fixture ({exception.GetType().Name})");
+                $"could not read the synthetic {fixtureName} fixture ({exception.GetType().Name})");
         }
 
         if (code.Length < sizeof(uint) || code.Length % sizeof(uint) != 0 ||
             BitConverter.ToUInt32(code) != 0x07230203)
         {
             throw new ProbeFailureException(
-                "synthetic exec-cs.spv is not a complete SPIR-V module; regenerate it with ShaderDump");
+                $"synthetic {fixtureName} is not a complete SPIR-V module; regenerate it with ShaderDump");
         }
 
-        Console.WriteLine($"fixture: synthetic exec-cs.spv ({code.Length} bytes)");
-        return code;
+        Console.WriteLine($"fixture: synthetic {fixtureName} ({code.Length} bytes)");
+        return (code, fixture);
     }
 
-    private static unsafe int RunVulkan(byte[] code)
+    private static unsafe int RunVulkan(byte[] code, ProbeFixture fixture)
     {
         Vk vk;
         try
@@ -275,6 +277,7 @@ internal static class NvidiaVulkanProbe
                 {
                     words[index] = Sentinel;
                 }
+                InitializeFixture(words, fixture);
 
                 fixed (byte* pCode = code)
                 {
@@ -471,7 +474,7 @@ internal static class NvidiaVulkanProbe
                 queueCompleted = true;
                 Console.WriteLine("dispatch: completed within 10 second GPU timeout");
 
-                return VerifyReadback(words);
+                return VerifyReadback(words, fixture);
             }
             finally
             {
@@ -665,7 +668,31 @@ internal static class NvidiaVulkanProbe
             "selected NVIDIA device has no host-visible, host-coherent memory for readback");
     }
 
-    private static unsafe int VerifyReadback(uint* words)
+    private static unsafe void InitializeFixture(uint* words, ProbeFixture fixture)
+    {
+        if (fixture != ProbeFixture.AtomicClamp)
+        {
+            return;
+        }
+
+        words[0] = 2;
+        words[1] = 5;
+        words[2] = 6;
+        words[3] = 0;
+        words[4] = 3;
+        words[5] = 6;
+        words[6] = 4;
+    }
+
+    private static unsafe int VerifyReadback(uint* words, ProbeFixture fixture) =>
+        fixture switch
+        {
+            ProbeFixture.Exec => VerifyExecReadback(words),
+            ProbeFixture.AtomicClamp => VerifyAtomicClampReadback(words),
+            _ => throw new ProbeFailureException("unknown synthetic fixture"),
+        };
+
+    private static unsafe int VerifyExecReadback(uint* words)
     {
         var expectedFma = BitConverter.SingleToUInt32Bits(
             MathF.FusedMultiplyAdd(1.5f, 2.25f, 10.0f));
@@ -717,6 +744,48 @@ internal static class NvidiaVulkanProbe
         return 1;
     }
 
+    private static unsafe int VerifyAtomicClampReadback(uint* words)
+    {
+        var expected = new (string Name, int Index, uint Value)[]
+        {
+            ("INC old<DATA final", 0, 3),
+            ("INC old==DATA final", 1, 0),
+            ("INC old>DATA final", 2, 0),
+            ("DEC old==0 final", 3, 5),
+            ("DEC old<DATA final", 4, 2),
+            ("DEC old>DATA final", 5, 5),
+            ("EXEC=0 atomic suppressed", 6, 4),
+            ("unused dword 7", 7, Sentinel),
+            ("INC old<DATA return", 8, 2),
+            ("INC old==DATA return", 9, 5),
+            ("INC old>DATA return", 10, 6),
+            ("DEC old==0 return", 11, 0),
+            ("DEC old<DATA return", 12, 3),
+            ("DEC old>DATA return", 13, 6),
+            ("unused dword 14", 14, Sentinel),
+            ("unused dword 15", 15, Sentinel),
+        };
+
+        var failures = 0;
+        foreach (var (name, index, value) in expected)
+        {
+            var actual = words[index];
+            var passed = actual == value;
+            failures += passed ? 0 : 1;
+            Console.WriteLine(
+                $"readback: {(passed ? "PASS" : "FAIL")} {name}; actual=0x{actual:X8}; expected=0x{value:X8}");
+        }
+
+        if (failures == 0)
+        {
+            Console.WriteLine("RESULT: NVIDIA Vulkan atomic-clamp fixture passed");
+            return 0;
+        }
+
+        Console.WriteLine($"RESULT: FAIL with {failures} atomic-clamp readback mismatch(es)");
+        return 1;
+    }
+
     private static void Check(Result result, string operation)
     {
         if (result != Result.Success)
@@ -725,11 +794,16 @@ internal static class NvidiaVulkanProbe
         }
     }
 
-    private static bool IsExecFixture(string path) =>
-        string.Equals(
-            Path.GetFileName(path),
-            "exec-cs.spv",
-            StringComparison.OrdinalIgnoreCase);
+    private static bool TryGetFixture(string path, out ProbeFixture fixture)
+    {
+        fixture = Path.GetFileName(path).ToLowerInvariant() switch
+        {
+            "exec-cs.spv" => ProbeFixture.Exec,
+            "atomic-clamp-cs.spv" => ProbeFixture.AtomicClamp,
+            _ => ProbeFixture.Unknown,
+        };
+        return fixture != ProbeFixture.Unknown;
+    }
 
     private static string FormatApiVersion(uint version) =>
         $"{(version >> 22) & 0x7F}.{(version >> 12) & 0x3FF}.{version & 0xFFF}";
@@ -740,9 +814,9 @@ internal static class NvidiaVulkanProbe
     private static void PrintUsage()
     {
         Console.WriteLine(
-            "usage: SharpEmu.Tools.GpuConformance <ShaderDump-output/exec-cs.spv>");
+            "usage: SharpEmu.Tools.GpuConformance <ShaderDump-output/{exec,atomic-clamp}-cs.spv>");
         Console.WriteLine(
-            "Runs only the synthetic exec compute fixture on an NVIDIA Vulkan device; maximum duration is 15 seconds.");
+            "Runs only a supported synthetic compute fixture on an NVIDIA Vulkan device; maximum duration is 15 seconds.");
     }
 
     private static void WriteWorkerOutput(string stdout, string stderr)
@@ -759,4 +833,11 @@ internal static class NvidiaVulkanProbe
     }
 
     private sealed class ProbeFailureException(string message) : Exception(message);
+
+    private enum ProbeFixture
+    {
+        Unknown,
+        Exec,
+        AtomicClamp,
+    }
 }
