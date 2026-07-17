@@ -103,6 +103,34 @@ public sealed class Gen5InstructionHandlingContractTests
             error);
     }
 
+    [Fact]
+    public void VInterpMovF32_FailsBeforeInterpolationLoweringWithStableIdentity()
+    {
+        var (ctx, state) = Decode(
+            0xC8020000, // v_interp_mov_f32 v0, p0, attr0.x
+            0xBF810000); // s_endpgm
+
+        Assert.Equal("VInterpMovF32", state.Program.Instructions[0].Opcode);
+        Assert.True(
+            Gen5ShaderScalarEvaluator.TryEvaluate(
+                ctx,
+                state,
+                out var evaluation,
+                out var error),
+            error);
+        Assert.False(
+            Gen5SpirvTranslator.TryCompilePixelShader(
+                state,
+                evaluation,
+                Gen5PixelOutputKind.Float,
+                out _,
+                out error));
+        Assert.Equal(
+            "block=0x0: emit-failed opcode=VInterpMovF32 encoding=Vintrp " +
+            "pc=0x0 words=[0xC8020000] detail=unsupported decoded instruction",
+            error);
+    }
+
     private static Gen5ShaderInstruction Instruction(
         Gen5ShaderEncoding encoding,
         string opcode) =>

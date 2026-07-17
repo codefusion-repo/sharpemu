@@ -2117,6 +2117,12 @@ public static partial class Gen5SpirvTranslator
             out string error)
         {
             error = string.Empty;
+            if (instruction.Opcode == "VInterpMovF32")
+            {
+                error = "unsupported decoded instruction";
+                return false;
+            }
+
             if (_stage != Gen5SpirvStage.Pixel ||
                 !_pixelInputs.TryGetValue(interpolation.Attribute, out var input) ||
                 !TryGetVectorDestination(instruction, out var destination))
