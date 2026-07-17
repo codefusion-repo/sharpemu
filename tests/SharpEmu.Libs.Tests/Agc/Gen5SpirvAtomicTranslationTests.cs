@@ -31,7 +31,7 @@ public sealed class Gen5SpirvAtomicTranslationTests
 
         Assert.Contains((ushort)SpirvOp.AtomicUMax, opcodes);
         Assert.Contains((ushort)SpirvOp.AtomicCompareExchange, opcodes);
-        Assert.Contains((ushort)SpirvOp.AtomicIIncrement, opcodes);
+        Assert.DoesNotContain((ushort)SpirvOp.AtomicIIncrement, opcodes);
     }
 
     [Fact]
@@ -67,6 +67,67 @@ public sealed class Gen5SpirvAtomicTranslationTests
         Assert.Contains((ushort)SpirvOp.AtomicIAdd, opcodes);
     }
 
+    [Fact]
+    public void BufferAtomicClamp_EmitsCompareExchangeRetryLoops()
+    {
+        // BUFFER_ATOMIC_INC/DEC v1, off, s[0:3] with distinct dword offsets.
+        var spirv = CompileComputeSpirv(
+            [
+                0xE0F00000, 0x80000100,
+                0xE0F40004, 0x80000100,
+            ],
+            BufferDescriptorRegisters());
+
+        AssertAtomicClampLowering(
+            spirv,
+            expectedCompareExchanges: 2,
+            expectedScope: 1,
+            expectedEqualSemantics: 0x48,
+            expectedUnequalSemantics: 0x42);
+    }
+
+    [Fact]
+    public void ImageAtomicClamp_EmitsCompareExchangeRetryLoops()
+    {
+        // IMAGE_ATOMIC_INC/DEC v2, v[0:1], s[4:11] against an R32ui T#.
+        var spirv = CompileComputeSpirv(
+            [
+                0xF06C2100, 0x00010200,
+                0xF0702100, 0x00010200,
+            ],
+            new Dictionary<uint, uint>
+            {
+                [5] = 20u << 20,
+            });
+
+        AssertAtomicClampLowering(
+            spirv,
+            expectedCompareExchanges: 2,
+            expectedScope: 1,
+            expectedEqualSemantics: 0x808,
+            expectedUnequalSemantics: 0x802);
+        Assert.Contains((ushort)SpirvOp.ImageTexelPointer, CollectOpcodes(spirv));
+    }
+
+    [Fact]
+    public void DataShareAtomicClamp_EmitsCompareExchangeRetryLoops()
+    {
+        // DS_INC_RTN_U32 v3, v0, v1; DS_DEC_RTN_U32 v4, v0, v2.
+        var spirv = CompileComputeSpirv(
+            [
+                0xD88C0000, 0x03000100,
+                0xD8900000, 0x04000200,
+            ],
+            new Dictionary<uint, uint>());
+
+        AssertAtomicClampLowering(
+            spirv,
+            expectedCompareExchanges: 2,
+            expectedScope: 2,
+            expectedEqualSemantics: 0x108,
+            expectedUnequalSemantics: 0x102);
+    }
+
     private static Dictionary<uint, uint> BufferDescriptorRegisters() => new()
     {
         // V# in s[0:3]: base=BufferAddress, stride=0, numRecords=64 bytes, type=0.
@@ -77,6 +138,11 @@ public sealed class Gen5SpirvAtomicTranslationTests
     };
 
     private static HashSet<ushort> CompileCompute(
+        uint[] programWords,
+        Dictionary<uint, uint> userDataSgprs) =>
+        CollectOpcodes(CompileComputeSpirv(programWords, userDataSgprs));
+
+    private static byte[] CompileComputeSpirv(
         uint[] programWords,
         Dictionary<uint, uint> userDataSgprs)
     {
@@ -117,21 +183,67 @@ public sealed class Gen5SpirvAtomicTranslationTests
                 out var shader,
                 out error),
             error);
-        return CollectOpcodes(shader.Spirv);
+        return shader.Spirv;
+    }
+
+    private static void AssertAtomicClampLowering(
+        byte[] spirv,
+        int expectedCompareExchanges,
+        uint expectedScope,
+        uint expectedEqualSemantics,
+        uint expectedUnequalSemantics)
+    {
+        var instructions = ParseInstructions(spirv);
+        var opcodes = instructions.Select(instruction => instruction.Opcode).ToList();
+        var constants = instructions
+            .Where(instruction => instruction.Opcode == (ushort)SpirvOp.Constant)
+            .ToDictionary(instruction => instruction.Operands[1], instruction => instruction.Operands[2]);
+        var compareExchanges = instructions
+            .Where(instruction => instruction.Opcode == (ushort)SpirvOp.AtomicCompareExchange)
+            .ToArray();
+        Assert.Equal(expectedCompareExchanges, compareExchanges.Length);
+        Assert.All(compareExchanges, instruction =>
+        {
+            Assert.Equal(expectedScope, constants[instruction.Operands[3]]);
+            Assert.Equal(expectedEqualSemantics, constants[instruction.Operands[4]]);
+            Assert.Equal(expectedUnequalSemantics, constants[instruction.Operands[5]]);
+        });
+        Assert.True(
+            opcodes.Count(opcode => opcode == (ushort)SpirvOp.LoopMerge) >=
+            expectedCompareExchanges + 1);
+        Assert.Contains((ushort)SpirvOp.UGreaterThanEqual, opcodes);
+        Assert.Contains((ushort)SpirvOp.UGreaterThan, opcodes);
+        Assert.Contains((ushort)SpirvOp.LogicalOr, opcodes);
+        Assert.Contains((ushort)SpirvOp.IAdd, opcodes);
+        Assert.Contains((ushort)SpirvOp.ISub, opcodes);
+        Assert.Contains((ushort)SpirvOp.Select, opcodes);
+        Assert.DoesNotContain((ushort)SpirvOp.AtomicIIncrement, opcodes);
+        Assert.DoesNotContain((ushort)SpirvOp.AtomicIDecrement, opcodes);
     }
 
     private static HashSet<ushort> CollectOpcodes(byte[] spirv)
+        => ParseInstructions(spirv).Select(instruction => instruction.Opcode).ToHashSet();
+
+    private static List<(ushort Opcode, uint[] Operands)> ParseInstructions(byte[] spirv)
     {
-        var opcodes = new HashSet<ushort>();
+        var instructions = new List<(ushort Opcode, uint[] Operands)>();
         // 5-word SPIR-V header, then (wordCount << 16 | opcode) packed instructions.
         for (var offset = 5 * sizeof(uint); offset + sizeof(uint) <= spirv.Length;)
         {
             var word = BinaryPrimitives.ReadUInt32LittleEndian(
                 spirv.AsSpan(offset, sizeof(uint)));
-            opcodes.Add((ushort)word);
-            offset += Math.Max((int)(word >> 16), 1) * sizeof(uint);
+            var wordCount = Math.Max((int)(word >> 16), 1);
+            var operands = new uint[wordCount - 1];
+            for (var index = 0; index < operands.Length; index++)
+            {
+                operands[index] = BinaryPrimitives.ReadUInt32LittleEndian(
+                    spirv.AsSpan(offset + ((index + 1) * sizeof(uint)), sizeof(uint)));
+            }
+
+            instructions.Add(((ushort)word, operands));
+            offset += wordCount * sizeof(uint);
         }
 
-        return opcodes;
+        return instructions;
     }
 }
